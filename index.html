@@ -970,6 +970,62 @@
       return value.toFixed(4);
     }
 
+    function splitTeamInput(rawValue = '') {
+      const tokens = [];
+      let buffer = '';
+      let depth = 0;
+      for (const ch of rawValue) {
+        if (ch === '(') {
+          if (depth === 0 && buffer.trim()) {
+            tokens.push(buffer.trim());
+            buffer = '';
+          }
+          depth += 1;
+          buffer += ch;
+        } else if (ch === ')') {
+          depth = Math.max(0, depth - 1);
+          buffer += ch;
+        } else if (ch === ',' && depth === 0) {
+          if (buffer.trim()) {
+            tokens.push(buffer.trim());
+          }
+          buffer = '';
+        } else {
+          buffer += ch;
+        }
+      }
+      if (buffer.trim()) {
+        tokens.push(buffer.trim());
+      }
+      return tokens;
+    }
+
+    function parseTeamGroups(rawValue = '') {
+      const tokens = splitTeamInput(rawValue);
+      const teamGroups = [];
+      tokens.forEach((token, index) => {
+        let content = token;
+        if (token.startsWith('(') && token.endsWith(')')) {
+          content = token.slice(1, -1);
+        }
+        const aliases = content.split(',').map(v => v.trim()).filter(Boolean);
+        if (!aliases.length) {
+          return;
+        }
+        const normalizedAliases = aliases
+          .map(alias => normalizeName(alias))
+          .filter(Boolean);
+        const groupId = `team-group-${teamGroups.length}`;
+        teamGroups.push({
+          id: groupId,
+          displayName: aliases[0],
+          aliases,
+          normalizedAliases
+        });
+      });
+      return { teamGroups };
+    }
+
     function normalizeSecondsValue(value) {
       const num = Number(value);
       if (!Number.isFinite(num) || num <= 0) return null;
@@ -1150,12 +1206,9 @@
         })
         .filter(Boolean);
       
-      const teamsToCheck = (teamInput?.value || '')
-        .split(',')
-        .map(v => v.trim())
-        .filter(Boolean);
+      const { teamGroups } = parseTeamGroups(teamInput?.value || '');
       
-      return { contestIds, teamsToCheck, invalidIds };
+      return { contestIds, teamGroups, invalidIds };
     }
 
     async function ensureContestData(contestId, { forceRefetch = false } = {}) {
@@ -1182,25 +1235,30 @@
       return payload;
     }
 
-    function renderTeamsForContest(contestDiv, contestData, teamsToCheck, contestId) {
+    function renderTeamsForContest(contestDiv, contestData, teamGroups) {
       const rows = [];
       
-      for (const team of teamsToCheck) {
-        const lookup = findTeamRecord(team, contestData.ranklist, contestData.participants);
-        if (lookup?.entry) {
-          const entry = lookup.entry;
+      for (const group of teamGroups) {
+        const match = findBestGroupMatch(group, contestData.ranklist, contestData.participants);
+        if (match?.entry) {
+          const entry = match.entry;
+          const contestRank = entry.rank ?? '—';
+          const numericRank = Number(contestRank);
+          const rankValue = Number.isFinite(numericRank) ? numericRank : 999999;
           rows.push({
-            team: team,
-            contestRank: entry.rank ?? '—',
+            team: group.displayName,
+            alias: match.alias,
+            contestRank,
             solved: entry.solved ?? '—',
             penalty: entry.penaltyDisplay || entry.penalty || entry.time || '—',
             status: 'found',
             statusText: 'Found',
-            rankValue: typeof entry.rank === 'number' ? entry.rank : 999999
+            rankValue
           });
-        } else if (lookup?.participant) {
+        } else if (match?.participant) {
           rows.push({
-            team: team,
+            team: group.displayName,
+            alias: match.alias,
             contestRank: '—',
             solved: '—',
             penalty: '—',
@@ -1210,7 +1268,8 @@
           });
         } else {
           rows.push({
-            team: team,
+            team: group.displayName,
+            alias: null,
             contestRank: '—',
             solved: '—',
             penalty: '—',
@@ -1221,7 +1280,7 @@
         }
       }
       
-      // Sort teams by their contest ranking
+      // Sort teams by their contest ranking (best placements first)
       rows.sort((a, b) => a.rankValue - b.rankValue);
 
       let prevKey = null;
@@ -1254,6 +1313,7 @@
                 <td class="rank-col">${row.displayRank}</td>
                 <td class="team-col">
                   <div class="team-name">${row.team}</div>
+                  ${row.alias ? `<div class="team-meta">Matched as: ${row.alias}</div>` : ''}
                   ${row.contestRank !== '—' ? `<div class="team-meta">Contest rank: ${row.contestRank}</div>` : ''}
                 </td>
                 <td class="solved-col">${row.solved}</td>
@@ -1291,8 +1351,8 @@
       const aggregateContainer = document.getElementById('aggregateResults');
       if (!aggregateContainer) return;
 
-      const { teamsToCheck } = collectInputs();
-      if (!teamsToCheck.length) {
+      const { teamGroups } = collectInputs();
+      if (!teamGroups.length) {
         aggregateContainer.innerHTML = '<div class="aggregate-empty">Add at least one team to view the combined ranking.</div>';
         return;
       }
@@ -1312,7 +1372,7 @@
         return;
       }
 
-      const rows = buildAggregateRanking(contestIds, teamsToCheck);
+      const rows = buildAggregateRanking(contestIds, teamGroups);
       if (!rows.length) {
         aggregateContainer.innerHTML = '<div class="aggregate-empty">Teams were not found in the selected contests.</div>';
         return;
@@ -1356,13 +1416,12 @@
       return 0;
     }
 
-    function buildAggregateRanking(contestIds, teamsToCheck) {
+    function buildAggregateRanking(contestIds, teamGroups) {
       const statsByTeam = new Map();
-      teamsToCheck.forEach(name => {
-        const normalized = normalizeName(name);
-        statsByTeam.set(normalized, {
-          normalized,
-          displayName: name,
+      teamGroups.forEach(group => {
+        statsByTeam.set(group.id, {
+          id: group.id,
+          displayName: group.displayName,
           solved: 0,
           penalty: 0,
           appearances: 0
@@ -1372,15 +1431,14 @@
       for (const contestId of contestIds) {
         const contestData = contestCache.get(contestId);
         if (!contestData) continue;
-        for (const teamName of teamsToCheck) {
-          const normalized = normalizeName(teamName);
-          const stats = statsByTeam.get(normalized);
+        for (const group of teamGroups) {
+          const stats = statsByTeam.get(group.id);
           if (!stats) continue;
-          const lookup = findTeamRecord(teamName, contestData.ranklist, contestData.participants);
-          if (lookup?.entry) {
+          const match = findBestGroupMatch(group, contestData.ranklist, contestData.participants);
+          if (match?.entry) {
             stats.appearances += 1;
-            stats.solved += Number(lookup.entry.solved) || 0;
-            stats.penalty += normalizePenaltyValue(lookup.entry);
+            stats.solved += Number(match.entry.solved) || 0;
+            stats.penalty += normalizePenaltyValue(match.entry);
           }
         }
       }
@@ -1414,8 +1472,8 @@
       const eloContainer = document.getElementById('eloResults');
       if (!eloContainer) return;
 
-      const { teamsToCheck } = collectInputs();
-      if (!teamsToCheck.length) {
+      const { teamGroups } = collectInputs();
+      if (!teamGroups.length) {
         eloContainer.innerHTML = '<div class="elo-empty">Add at least one team to compute Elo standings.</div>';
         return;
       }
@@ -1435,7 +1493,7 @@
         return;
       }
 
-      const rows = buildEloStandings(contestIds, teamsToCheck, selectionState.eloMode || 'normal');
+      const rows = buildEloStandings(contestIds, teamGroups, selectionState.eloMode || 'normal');
       if (!rows.length) {
         eloContainer.innerHTML = '<div class="elo-empty">No completed contest placements available yet.</div>';
         return;
@@ -1467,47 +1525,46 @@
       `;
     }
 
-    function buildEloStandings(contestIds, teamsToCheck, mode = 'normal') {
-      if (!contestIds.length || !teamsToCheck.length) {
+    function buildEloStandings(contestIds, teamGroups, mode = 'normal') {
+      if (!contestIds.length || !teamGroups.length) {
         return [];
       }
 
       const eloMode = mode || 'normal';
       const ratingState = new Map();
 
-      const ensureTeam = (teamName) => {
-        const normalized = normalizeName(teamName);
-        let record = ratingState.get(normalized);
+      const ensureTeam = (group) => {
+        if (!group) return null;
+        let record = ratingState.get(group.id);
         if (!record) {
           record = {
-            normalized,
-            name: teamName,
+            id: group.id,
+            name: group.displayName,
             rating: ELO_BASE_RATING,
             wins: 0,
             losses: 0,
             draws: 0,
             contests: 0
           };
-          ratingState.set(normalized, record);
+          ratingState.set(group.id, record);
         }
         return record;
       };
 
-      teamsToCheck.forEach(name => ensureTeam(name));
+      teamGroups.forEach(group => ensureTeam(group));
 
       for (const contestId of contestIds) {
         const contestData = contestCache.get(contestId);
         if (!contestData?.ranklist) continue;
 
         const condensed = new Map();
-        for (const teamName of teamsToCheck) {
-          const lookup = findTeamRecord(teamName, contestData.ranklist, contestData.participants);
-          const rankValue = Number(lookup?.entry?.rank);
+        for (const group of teamGroups) {
+          const match = findBestGroupMatch(group, contestData.ranklist, contestData.participants);
+          const rankValue = Number(match?.entry?.rank);
           if (!Number.isFinite(rankValue)) continue;
-          const normalized = normalizeName(teamName);
-          const existing = condensed.get(normalized);
+          const existing = condensed.get(group.id);
           if (!existing || rankValue < existing.rank) {
-            condensed.set(normalized, { normalized, team: teamName, rank: rankValue });
+            condensed.set(group.id, { group, rank: rankValue });
           }
         }
 
@@ -1518,20 +1575,15 @@
         let ordered = Array.from(condensed.values()).sort((a, b) => a.rank - b.rank);
 
         if (!ordered.length && eloMode === 'zero-participation') {
-          ordered = teamsToCheck.map(teamName => ({
-            normalized: normalizeName(teamName),
-            team: teamName,
-            rank: Number.MAX_SAFE_INTEGER
-          }));
+          ordered = teamGroups.map(group => ({ group, rank: Number.MAX_SAFE_INTEGER }));
         }
 
         if (eloMode === 'zero-participation') {
-          const present = new Set(ordered.map(item => item.normalized));
-          teamsToCheck.forEach(teamName => {
-            const normalized = normalizeName(teamName);
-            if (!present.has(normalized)) {
-              ordered.push({ normalized, team: teamName, rank: Number.MAX_SAFE_INTEGER });
-              present.add(normalized);
+          const present = new Set(ordered.map(item => item.group.id));
+          teamGroups.forEach(group => {
+            if (!present.has(group.id)) {
+              ordered.push({ group, rank: Number.MAX_SAFE_INTEGER });
+              present.add(group.id);
             }
           });
           ordered = ordered.sort((a, b) => a.rank - b.rank);
@@ -1540,17 +1592,18 @@
         const seenThisContest = new Set();
 
         ordered.forEach(entry => {
-          const record = ensureTeam(entry.team);
-          if (!seenThisContest.has(record.normalized)) {
+          const record = ensureTeam(entry.group);
+          if (record && !seenThisContest.has(record.id)) {
             record.contests += 1;
-            seenThisContest.add(record.normalized);
+            seenThisContest.add(record.id);
           }
         });
 
         for (let i = 0; i < ordered.length; i++) {
           for (let j = i + 1; j < ordered.length; j++) {
-            const teamA = ensureTeam(ordered[i].team);
-            const teamB = ensureTeam(ordered[j].team);
+            const teamA = ensureTeam(ordered[i].group);
+            const teamB = ensureTeam(ordered[j].group);
+            if (!teamA || !teamB) continue;
             const expectedA = 1 / (1 + Math.pow(10, (teamB.rating - teamA.rating) / 400));
             const expectedB = 1 - expectedA;
             let scoreA = 1;
@@ -1597,7 +1650,7 @@
 
     async function renderResults({ forceRefetch = false, useCacheOnly = false, showSpinner = false, silentErrors = false } = {}) {
       const container = document.getElementById('results');
-      const { contestIds, teamsToCheck } = collectInputs();
+      const { contestIds, teamGroups } = collectInputs();
 
       prepareAggregateView(contestIds);
       refreshAggregateRanking();
@@ -1610,7 +1663,7 @@
         return false;
       }
 
-      if (!teamsToCheck.length) {
+      if (!teamGroups.length) {
         // Don't clear contests, just return
         return false;
       }
@@ -1661,7 +1714,7 @@
           </div>`;
         } else {
           rendered = true;
-          renderTeamsForContest(contestDiv, contestData, teamsToCheck, contestId);
+          renderTeamsForContest(contestDiv, contestData, teamGroups);
         }
 
         if (fragment.contains(contestDiv)) {
@@ -1707,6 +1760,36 @@
       }
 
       return null;
+    }
+
+    function findBestGroupMatch(teamGroup, ranklist, participants = {}) {
+      if (!teamGroup) return null;
+      let bestEntry = null;
+      let bestAlias = null;
+      let fallbackParticipant = null;
+      let fallbackAlias = null;
+
+      for (const alias of teamGroup.aliases) {
+        const lookup = findTeamRecord(alias, ranklist, participants);
+        if (lookup?.entry) {
+          const entry = lookup.entry;
+          const entryRank = Number(entry.rank);
+          const currentBestRank = bestEntry ? Number(bestEntry.rank) : Infinity;
+          if (!bestEntry || (Number.isFinite(entryRank) && entryRank < currentBestRank)) {
+            bestEntry = entry;
+            bestAlias = alias;
+          }
+        } else if (lookup?.participant && !fallbackParticipant) {
+          fallbackParticipant = lookup.participant;
+          fallbackAlias = alias;
+        }
+      }
+
+      return {
+        entry: bestEntry,
+        participant: fallbackParticipant,
+        alias: bestAlias || fallbackAlias || null
+      };
     }
 
     // Initialize on page load
