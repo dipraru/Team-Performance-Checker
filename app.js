@@ -20,6 +20,27 @@ let autoRefreshTimer = null;
 let contestFetchTimer = null;
 const AUTO_REFRESH_DELAY = 800;
 const CONTEST_FETCH_DELAY = 500;
+const TABLE_PAGE_SIZE = 50;
+
+const paginationState = new Map();
+const paginationRenderers = new Map();
+
+function createEmptyTeamContext() {
+  return {
+    key: '',
+    includeAllTeams: false,
+    teamGroups: [],
+    contestTeams: new Map(),
+    aliasDisplayMap: new Map(),
+    pending: false
+  };
+}
+
+let currentTeamContext = createEmptyTeamContext();
+
+function invalidateTeamContext() {
+  currentTeamContext = createEmptyTeamContext();
+}
 
 function registerInputListener(inputId) {
   const input = document.getElementById(inputId);
@@ -34,6 +55,78 @@ function registerInputListener(inputId) {
       scheduleAutoRefresh();
     });
   }
+}
+
+function toggleTeamInputMode(includeAll) {
+  const teamInput = document.getElementById('teamInput');
+  const tip = document.getElementById('teamAliasTip');
+  const mergeWrapper = document.getElementById('teamMergeWrapper');
+  if (teamInput) {
+    teamInput.disabled = includeAll;
+    if (includeAll) {
+      teamInput.classList.add('input-disabled');
+    } else {
+      teamInput.classList.remove('input-disabled');
+    }
+  }
+  if (tip) {
+    tip.style.display = includeAll ? 'none' : 'block';
+  }
+  if (mergeWrapper) {
+    mergeWrapper.style.display = includeAll ? 'block' : 'none';
+  }
+}
+
+function registerTableRenderer(tableId, renderFn) {
+  if (!tableId) return;
+  paginationRenderers.set(tableId, renderFn);
+}
+
+function renderPaginatedTable({
+  container,
+  tableId,
+  headerHtml = '',
+  rows = [],
+  rowRenderer = () => '',
+  tableClass = 'contest-table',
+  pageSize = TABLE_PAGE_SIZE,
+  emptyStateHtml = ''
+}) {
+  if (!container || !tableId) return;
+  const totalPages = Math.max(1, Math.ceil((rows.length || 0) / pageSize));
+  const prevState = paginationState.get(tableId) || { page: 1 };
+  const page = Math.min(Math.max(prevState.page || 1, 1), totalPages);
+  paginationState.set(tableId, { page, totalPages });
+
+  registerTableRenderer(tableId, () => {
+    renderPaginatedTable({ container, tableId, headerHtml, rows, rowRenderer, tableClass, pageSize, emptyStateHtml });
+  });
+
+  const start = (page - 1) * pageSize;
+  const visibleRows = rows.slice(start, start + pageSize);
+  const tableBody = visibleRows.length
+    ? visibleRows.map(rowRenderer).join('')
+    : (emptyStateHtml || '<tr><td colspan="100%">No data available.</td></tr>');
+
+  const paginationControls = rows.length > pageSize
+    ? `
+      <div class="table-pagination" data-table-id="${tableId}">
+        <button class="page-btn" data-page-action="prev" ${page === 1 ? 'disabled' : ''}>Previous</button>
+        <span class="page-info">Page ${page} of ${totalPages}</span>
+        <button class="page-btn" data-page-action="next" ${page === totalPages ? 'disabled' : ''}>Next</button>
+      </div>
+    `
+    : '';
+
+  container.innerHTML = `
+    <div class="table-host-inner">
+      <table class="${tableClass}">
+        ${headerHtml}
+        <tbody>${tableBody}</tbody>
+      </table>
+      ${paginationControls}
+    </div>
+  `;
 }
 
 function scheduleContestFetch() {
@@ -329,6 +422,209 @@ function parseTeamGroups(rawValue = '') {
   return { teamGroups };
 }
 
+function extractEntryAliases(entry = {}) {
+  const aliases = [];
+  const push = (value) => {
+    if (value) aliases.push(value);
+  };
+  push(entry.team_name);
+  push(entry.teamName);
+  push(entry.username);
+  push(entry.userName);
+  if (Array.isArray(entry.aliases)) {
+    entry.aliases.forEach(push);
+  }
+  return Array.from(new Set(aliases.filter(Boolean)));
+}
+
+function getParticipantHandle(participants = {}, teamId) {
+  if (!participants || teamId === undefined || teamId === null) return '';
+  const info = participants[teamId];
+  if (!info) return '';
+  if (Array.isArray(info)) {
+    return info[0] || info[1] || '';
+  }
+  if (typeof info === 'object') {
+    return info.username || info.userName || info.name || '';
+  }
+  return '';
+}
+
+function derivePreferredHandle(entry = {}, participants = {}) {
+  const teamId = entry.team_id ?? entry.teamId ?? entry.id;
+  return getParticipantHandle(participants, teamId)
+    || entry.userName
+    || entry.username
+    || entry.name
+    || entry.team_name
+    || entry.teamName
+    || '';
+}
+
+function buildAliasDisplayMap(teamGroups = []) {
+  const map = new Map();
+  teamGroups.forEach(group => {
+    (group.normalizedAliases || []).forEach(alias => {
+      if (alias && !map.has(alias)) {
+        map.set(alias, group);
+      }
+    });
+  });
+  return map;
+}
+
+function buildAutoTeamContext(contestIds, mergeGroups = []) {
+  const canonicalLookup = new Map();
+  const aliasDisplayMap = new Map();
+  const contestTeams = new Map();
+  let autoIndex = 0;
+
+  const mergeAliasLookup = new Map();
+  const canonicalNameMap = new Map();
+  mergeGroups.forEach((group, idx) => {
+    const canonicalKey = `merge-${idx}`;
+    canonicalNameMap.set(canonicalKey, group.displayName);
+    (group.normalizedAliases || []).forEach(alias => {
+      if (alias) {
+        mergeAliasLookup.set(alias, canonicalKey);
+      }
+    });
+  });
+
+  const ensureGroup = (canonicalKey, preferredName, aliases = []) => {
+    let group = canonicalLookup.get(canonicalKey);
+    if (!group) {
+      const displayName = canonicalNameMap.get(canonicalKey) || preferredName || `Team ${autoIndex + 1}`;
+      group = {
+        id: `auto-team-${autoIndex++}`,
+        displayName,
+        aliases: [],
+        normalizedAliases: []
+      };
+      canonicalLookup.set(canonicalKey, group);
+      const normalizedDisplay = normalizeName(displayName);
+      if (normalizedDisplay && !group.normalizedAliases.includes(normalizedDisplay)) {
+        group.normalizedAliases.push(normalizedDisplay);
+        aliasDisplayMap.set(normalizedDisplay, group);
+      }
+      if (!group.aliases.includes(displayName)) {
+        group.aliases.push(displayName);
+      }
+    }
+    aliases.forEach(alias => {
+      if (!alias) return;
+      if (!group.aliases.includes(alias)) {
+        group.aliases.push(alias);
+      }
+      const normalized = normalizeName(alias);
+      if (normalized && !group.normalizedAliases.includes(normalized)) {
+        group.normalizedAliases.push(normalized);
+        aliasDisplayMap.set(normalized, group);
+      }
+    });
+    return group;
+  };
+
+  contestIds.forEach(contestId => {
+    const contestData = contestCache.get(contestId);
+    if (!contestData?.ranklist) return;
+    const bestByGroup = new Map();
+    let fallbackIndex = 0;
+    contestData.ranklist.forEach(entry => {
+      const aliases = extractEntryAliases(entry);
+      const normalizedAliases = aliases.map(normalizeName).filter(Boolean);
+      let canonicalKey = normalizedAliases
+        .map(alias => mergeAliasLookup.get(alias))
+        .find(Boolean);
+      if (!canonicalKey) {
+        canonicalKey = normalizedAliases[0] || `contest-${contestId}-team-${fallbackIndex++}`;
+      }
+      const preferredHandle = derivePreferredHandle(entry, contestData.participants) || aliases[0];
+      const aliasBucket = aliases.slice();
+      if (preferredHandle) {
+        aliasBucket.unshift(preferredHandle);
+      }
+      const group = ensureGroup(canonicalKey, preferredHandle || `Team ${canonicalKey}`, aliasBucket);
+      const existing = bestByGroup.get(group.id);
+      const currentRank = Number(entry.rank);
+      const existingRank = Number(existing?.entry?.rank);
+      if (!existing || (Number.isFinite(currentRank) && (!Number.isFinite(existingRank) || currentRank < existingRank))) {
+        bestByGroup.set(group.id, { group, entry });
+      }
+    });
+    const ordered = Array.from(bestByGroup.values()).sort((a, b) => {
+      const rankA = Number(a.entry.rank);
+      const rankB = Number(b.entry.rank);
+      if (Number.isFinite(rankA) && Number.isFinite(rankB)) {
+        return rankA - rankB;
+      }
+      if (Number.isFinite(rankA)) return -1;
+      if (Number.isFinite(rankB)) return 1;
+      return 0;
+    });
+    contestTeams.set(contestId, ordered);
+  });
+
+  return {
+    teamGroups: Array.from(canonicalLookup.values()),
+    contestTeams,
+    aliasDisplayMap
+  };
+}
+
+function computeTeamContext(inputs, { forceRebuild = false } = {}) {
+  if (!inputs) {
+    return currentTeamContext;
+  }
+
+  const contextKey = JSON.stringify({
+    contestIds: inputs.contestIds,
+    includeAllTeams: inputs.includeAllTeams,
+    teamInput: inputs.rawTeamInput,
+    mergeInput: inputs.rawMergeInput
+  });
+
+  if (!forceRebuild && currentTeamContext.key === contextKey) {
+    return currentTeamContext;
+  }
+
+  let nextContext;
+  if (!inputs.includeAllTeams) {
+    nextContext = {
+      key: contextKey,
+      includeAllTeams: false,
+      teamGroups: inputs.manualTeamGroups,
+      contestTeams: new Map(),
+      aliasDisplayMap: buildAliasDisplayMap(inputs.manualTeamGroups),
+      pending: false
+    };
+  } else {
+    const missingData = inputs.contestIds.some(id => !contestCache.has(id));
+    if (missingData) {
+      nextContext = {
+        key: contextKey,
+        includeAllTeams: true,
+        teamGroups: [],
+        contestTeams: new Map(),
+        aliasDisplayMap: new Map(),
+        pending: true
+      };
+    } else {
+      const autoData = buildAutoTeamContext(inputs.contestIds, inputs.mergeGroups);
+      nextContext = {
+        key: contextKey,
+        includeAllTeams: true,
+        teamGroups: autoData.teamGroups,
+        contestTeams: autoData.contestTeams,
+        aliasDisplayMap: autoData.aliasDisplayMap,
+        pending: false
+      };
+    }
+  }
+  currentTeamContext = nextContext;
+  return currentTeamContext;
+}
+
 function normalizeSecondsValue(value) {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return null;
@@ -493,6 +789,8 @@ function buildRanklist(rankData) {
 function collectInputs() {
   const contestInput = document.getElementById('contestInput');
   const teamInput = document.getElementById('teamInput');
+  const mergeInput = document.getElementById('teamMergeInput');
+  const includeAllCheckbox = document.getElementById('includeAllTeams');
   
   const invalidIds = [];
   const contestIds = (contestInput?.value || '')
@@ -500,7 +798,6 @@ function collectInputs() {
     .map(v => {
       const value = v.trim();
       if (!value) return null;
-      // Check if it's a valid number
       if (!/^\d+$/.test(value)) {
         invalidIds.push(value);
         return null;
@@ -508,10 +805,22 @@ function collectInputs() {
       return value;
     })
     .filter(Boolean);
-  
-  const { teamGroups } = parseTeamGroups(teamInput?.value || '');
-  
-  return { contestIds, teamGroups, invalidIds };
+
+  const rawTeamInput = teamInput?.value || '';
+  const rawMergeInput = mergeInput?.value || '';
+  const includeAllTeams = includeAllCheckbox?.checked || false;
+  const { teamGroups: manualTeamGroups } = parseTeamGroups(includeAllTeams ? '' : rawTeamInput);
+  const { teamGroups: mergeGroups } = parseTeamGroups(rawMergeInput);
+
+  return {
+    contestIds,
+    invalidIds,
+    includeAllTeams,
+    manualTeamGroups,
+    mergeGroups,
+    rawTeamInput,
+    rawMergeInput
+  };
 }
 
 async function ensureContestData(contestId, { forceRefetch = false } = {}) {
@@ -535,100 +844,140 @@ async function ensureContestData(contestId, { forceRefetch = false } = {}) {
     fetchedAt: Date.now()
   };
   contestCache.set(contestId, payload);
+  invalidateTeamContext();
   return payload;
 }
 
-function renderTeamsForContest(contestDiv, contestData, teamGroups) {
-  const rows = [];
-  
-  for (const group of teamGroups) {
-    const match = findBestGroupMatch(group, contestData.ranklist, contestData.participants);
-    if (match?.entry) {
-      const entry = match.entry;
+function renderTeamsForContest(contestDiv, contestData, teamGroups, options = {}) {
+  const { includeAllTeams = false, contestId = null } = options;
+  const tableHost = document.createElement('div');
+  tableHost.className = 'table-host';
+  contestDiv.appendChild(tableHost);
+
+  let rows = [];
+
+  if (includeAllTeams) {
+    const contestEntries = (options.contestTeams || currentTeamContext.contestTeams.get(contestId)) || [];
+    if (!contestEntries.length) {
+      tableHost.innerHTML = '<div class="aggregate-empty">Contest data is still loading...</div>';
+      return;
+    }
+    rows = contestEntries.map(({ group, entry }) => {
       const contestRank = entry.rank ?? '—';
       const numericRank = Number(contestRank);
-      const rankValue = Number.isFinite(numericRank) ? numericRank : 999999;
-      rows.push({
-        team: group.displayName,
-        alias: match.alias,
+      const handle = derivePreferredHandle(entry, options.participants || contestData.participants);
+      const displayName = handle || group?.displayName || entry.team_name || entry.teamName || 'Team';
+      const aliasName = entry.team_name && entry.team_name !== displayName ? entry.team_name : null;
+      return {
+        team: displayName,
+        alias: aliasName,
         contestRank,
         solved: entry.solved ?? '—',
         penalty: entry.penaltyDisplay || entry.penalty || entry.time || '—',
         status: 'found',
         statusText: 'Found',
-        rankValue
-      });
-    } else if (match?.participant) {
-      rows.push({
-        team: group.displayName,
-        alias: match.alias,
-        contestRank: '—',
-        solved: '—',
-        penalty: '—',
-        status: 'registered',
-        statusText: 'Registered',
-        rankValue: 999999
-      });
-    } else {
-      rows.push({
-        team: group.displayName,
-        alias: null,
-        contestRank: '—',
-        solved: '—',
-        penalty: '—',
-        status: 'not-found',
-        statusText: 'Not Found',
-        rankValue: 999999
-      });
+        rankValue: Number.isFinite(numericRank) ? numericRank : 999999
+      };
+    });
+    rows.sort((a, b) => a.rankValue - b.rankValue);
+    rows.forEach((row, index) => {
+      row.displayRank = Number.isFinite(row.rankValue) ? row.rankValue : index + 1;
+    });
+  } else {
+    const manualRows = [];
+    for (const group of teamGroups) {
+      const match = findBestGroupMatch(group, contestData.ranklist, contestData.participants);
+      if (match?.entry) {
+        const entry = match.entry;
+        const contestRank = entry.rank ?? '—';
+        const numericRank = Number(contestRank);
+        const rankValue = Number.isFinite(numericRank) ? numericRank : 999999;
+        manualRows.push({
+          team: group.displayName,
+          alias: match.alias,
+          contestRank,
+          solved: entry.solved ?? '—',
+          penalty: entry.penaltyDisplay || entry.penalty || entry.time || '—',
+          status: 'found',
+          statusText: 'Found',
+          rankValue
+        });
+      } else if (match?.participant) {
+        manualRows.push({
+          team: group.displayName,
+          alias: match.alias,
+          contestRank: '—',
+          solved: '—',
+          penalty: '—',
+          status: 'registered',
+          statusText: 'Registered',
+          rankValue: 999999
+        });
+      } else {
+        manualRows.push({
+          team: group.displayName,
+          alias: null,
+          contestRank: '—',
+          solved: '—',
+          penalty: '—',
+          status: 'not-found',
+          statusText: 'Not Found',
+          rankValue: 999999
+        });
+      }
     }
+
+    manualRows.sort((a, b) => a.rankValue - b.rankValue);
+    let prevKey = null;
+    let currentRank = 0;
+    manualRows.forEach((row, index) => {
+      const key = row.rankValue;
+      if (key !== prevKey) {
+        currentRank = index + 1;
+        prevKey = key;
+      }
+      row.displayRank = currentRank;
+    });
+    rows = manualRows;
   }
-  
-  // Sort teams by their contest ranking (best placements first)
-  rows.sort((a, b) => a.rankValue - b.rankValue);
 
-  let prevKey = null;
-  let currentRank = 0;
-  rows.forEach((row, index) => {
-    const key = row.rankValue;
-    if (key !== prevKey) {
-      currentRank = index + 1;
-      prevKey = key;
-    }
-    row.displayRank = currentRank;
-  });
+  if (!rows.length) {
+    tableHost.innerHTML = '<div class="aggregate-empty">No teams to display for this contest.</div>';
+    return;
+  }
 
-  if (rows.length === 0) return;
-
-  const tableHTML = `
-    <table class="contest-table">
-      <thead>
-        <tr>
-          <th class="rank-col">Rank</th>
-          <th class="team-col">Team Name</th>
-          <th class="solved-col">Solved</th>
-          <th class="penalty-col">Penalty</th>
-          <th class="status-col">Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows.map(row => `
-          <tr>
-            <td class="rank-col">${row.displayRank}</td>
-            <td class="team-col">
-              <div class="team-name">${row.team}</div>
-              ${row.alias ? `<div class="team-meta">Matched as: ${row.alias}</div>` : ''}
-              ${row.contestRank !== '—' ? `<div class="team-meta">Contest rank: ${row.contestRank}</div>` : ''}
-            </td>
-            <td class="solved-col">${row.solved}</td>
-            <td class="penalty-col">${row.penalty}</td>
-            <td class="status-col"><span class="status-badge status-${row.status}">${row.statusText}</span></td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
+  const headerHtml = `
+    <thead>
+      <tr>
+        <th class="rank-col">Rank</th>
+        <th class="team-col">Team Name</th>
+        <th class="solved-col">Solved</th>
+        <th class="penalty-col">Penalty</th>
+        <th class="status-col">Status</th>
+      </tr>
+    </thead>
   `;
-  
-  contestDiv.innerHTML += tableHTML;
+
+  renderPaginatedTable({
+    container: tableHost,
+    tableId: `contest-${contestId || 'unknown'}-table`,
+    headerHtml,
+    rows,
+    tableClass: 'contest-table',
+    rowRenderer: (row) => `
+      <tr>
+        <td class="rank-col">${row.displayRank}</td>
+        <td class="team-col">
+          <div class="team-name">${row.team}</div>
+          ${row.alias ? `<div class="team-meta">${includeAllTeams ? 'Listed in contest as' : 'Matched as'}: ${row.alias}</div>` : ''}
+          ${!includeAllTeams && row.contestRank !== '—' ? `<div class="team-meta">Contest rank: ${row.contestRank}</div>` : ''}
+        </td>
+        <td class="solved-col">${row.solved}</td>
+        <td class="penalty-col">${row.penalty}</td>
+        <td class="status-col"><span class="status-badge status-${row.status}">${row.statusText}</span></td>
+      </tr>
+    `
+  });
 }
 
 function prepareAggregateView(contestIds) {
@@ -654,60 +1003,68 @@ function refreshAggregateRanking() {
   const aggregateContainer = document.getElementById('aggregateResults');
   if (!aggregateContainer) return;
 
-  const { teamGroups } = collectInputs();
-  if (!teamGroups.length) {
-    aggregateContainer.innerHTML = '<div class="aggregate-empty">Add at least one team to view the combined ranking.</div>';
-    return;
-  }
-
+  const inputs = collectInputs();
   const contestIds = selectionState.mode === 'all'
     ? selectionState.contestIds
     : Array.from(selectionState.selected);
+
+  const teamContext = computeTeamContext(inputs);
+  if (!inputs.includeAllTeams && !teamContext.teamGroups.length) {
+    aggregateContainer.innerHTML = '<div class="aggregate-empty">Add at least one team to view the combined ranking.</div>';
+    return;
+  }
 
   if (!contestIds.length) {
     aggregateContainer.innerHTML = '<div class="aggregate-empty">Select at least one contest to merge.</div>';
     return;
   }
 
-  const missingData = contestIds.some(id => !contestCache.has(id));
-  if (missingData) {
+  if (teamContext.pending) {
     aggregateContainer.innerHTML = '<div class="aggregate-empty">Fetching contest data...</div>';
     return;
   }
 
-  const rows = buildAggregateRanking(contestIds, teamGroups);
+  const rows = buildAggregateRanking(contestIds, teamContext.teamGroups);
   if (!rows.length) {
     aggregateContainer.innerHTML = '<div class="aggregate-empty">Teams were not found in the selected contests.</div>';
     return;
   }
+  aggregateContainer.innerHTML = '';
+  const tableHost = document.createElement('div');
+  tableHost.className = 'table-host';
+  aggregateContainer.appendChild(tableHost);
 
-  const tbody = rows.map(row => `
-    <tr>
-      <td>${row.rank}</td>
-      <td>
-        <div class="team-name">${row.displayName}</div>
-        <div class="team-meta">${row.appearances} contest${row.appearances === 1 ? '' : 's'} with results</div>
-      </td>
-      <td>${row.appearances} / ${contestIds.length}</td>
-      <td>${row.solved}</td>
-      <td>${row.penaltyDisplay}</td>
-    </tr>
-  `).join('');
-
-  aggregateContainer.innerHTML = `
-    <table class="aggregate-table">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Team</th>
-          <th>Contests</th>
-          <th>Solved</th>
-          <th>Penalty</th>
-        </tr>
-      </thead>
-      <tbody>${tbody}</tbody>
-    </table>
+  const headerHtml = `
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Team</th>
+        <th>Contests</th>
+        <th>Solved</th>
+        <th>Penalty</th>
+      </tr>
+    </thead>
   `;
+
+  renderPaginatedTable({
+    container: tableHost,
+    tableId: 'aggregate-table',
+    headerHtml,
+    rows,
+    tableClass: 'aggregate-table',
+    rowRenderer: (row) => `
+      <tr>
+        <td>${row.rank}</td>
+        <td>
+          <div class="team-name">${row.displayName}</div>
+          <div class="team-meta">${row.appearances} contest${row.appearances === 1 ? '' : 's'} with results</div>
+        </td>
+        <td>${row.appearances} / ${contestIds.length}</td>
+        <td>${row.solved}</td>
+        <td>${row.penaltyDisplay}</td>
+      </tr>
+    `
+  });
 }
 
 function normalizePenaltyValue(entry) {
@@ -775,57 +1132,65 @@ function refreshEloStandings() {
   const eloContainer = document.getElementById('eloResults');
   if (!eloContainer) return;
 
-  const { teamGroups } = collectInputs();
-  if (!teamGroups.length) {
-    eloContainer.innerHTML = '<div class="elo-empty">Add at least one team to compute Elo standings.</div>';
-    return;
-  }
-
+  const inputs = collectInputs();
   const contestIds = selectionState.mode === 'all'
     ? selectionState.contestIds
     : Array.from(selectionState.selected);
+
+  const teamContext = computeTeamContext(inputs);
+  if (!inputs.includeAllTeams && !teamContext.teamGroups.length) {
+    eloContainer.innerHTML = '<div class="elo-empty">Add at least one team to compute Elo standings.</div>';
+    return;
+  }
 
   if (!contestIds.length) {
     eloContainer.innerHTML = '<div class="elo-empty">Select contests to include in the Elo standings.</div>';
     return;
   }
 
-  const missingData = contestIds.some(id => !contestCache.has(id));
-  if (missingData) {
+  if (teamContext.pending) {
     eloContainer.innerHTML = '<div class="elo-empty">Fetching contest data...</div>';
     return;
   }
 
-  const rows = buildEloStandings(contestIds, teamGroups, selectionState.eloMode || 'normal');
+  const rows = buildEloStandings(contestIds, teamContext.teamGroups, selectionState.eloMode || 'normal');
   if (!rows.length) {
     eloContainer.innerHTML = '<div class="elo-empty">No completed contest placements available yet.</div>';
     return;
   }
+  eloContainer.innerHTML = '';
+  const tableHost = document.createElement('div');
+  tableHost.className = 'table-host';
+  eloContainer.appendChild(tableHost);
 
-  const tbody = rows.map(row => `
-    <tr>
-      <td>${row.rank}</td>
-      <td>${row.name}</td>
-      <td class="rating-col">${row.ratingDisplay}</td>
-      <td>${row.contests}</td>
-      <td class="record-col">${row.wins}-${row.losses}-${row.draws}</td>
-    </tr>
-  `).join('');
-
-  eloContainer.innerHTML = `
-    <table class="rating-table">
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Team</th>
-          <th class="rating-col">Rating</th>
-          <th>Contests</th>
-          <th class="record-col">W-L-D</th>
-        </tr>
-      </thead>
-      <tbody>${tbody}</tbody>
-    </table>
+  const headerHtml = `
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Team</th>
+        <th class="rating-col">Rating</th>
+        <th>Contests</th>
+        <th class="record-col">W-L-D</th>
+      </tr>
+    </thead>
   `;
+
+  renderPaginatedTable({
+    container: tableHost,
+    tableId: 'elo-table',
+    headerHtml,
+    rows,
+    tableClass: 'rating-table',
+    rowRenderer: (row) => `
+      <tr>
+        <td>${row.rank}</td>
+        <td>${row.name}</td>
+        <td class="rating-col">${row.ratingDisplay}</td>
+        <td>${row.contests}</td>
+        <td class="record-col">${row.wins}-${row.losses}-${row.draws}</td>
+      </tr>
+    `
+  });
 }
 
 function buildEloStandings(contestIds, teamGroups, mode = 'normal') {
@@ -953,7 +1318,8 @@ function buildEloStandings(contestIds, teamGroups, mode = 'normal') {
 
 async function renderResults({ forceRefetch = false, useCacheOnly = false, showSpinner = false, silentErrors = false } = {}) {
   const container = document.getElementById('results');
-  const { contestIds, teamGroups } = collectInputs();
+  const inputs = collectInputs();
+  const contestIds = inputs.contestIds;
 
   prepareAggregateView(contestIds);
   refreshAggregateRanking();
@@ -966,8 +1332,11 @@ async function renderResults({ forceRefetch = false, useCacheOnly = false, showS
     return false;
   }
 
-  if (!teamGroups.length) {
-    // Don't clear contests, just return
+  let teamContext = computeTeamContext(inputs);
+  if (!inputs.includeAllTeams && !teamContext.teamGroups.length) {
+    if (!silentErrors) {
+      container.innerHTML = '<div class="error">Add at least one team to compare.</div>';
+    }
     return false;
   }
 
@@ -982,26 +1351,29 @@ async function renderResults({ forceRefetch = false, useCacheOnly = false, showS
     container.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading contest data...</p></div>';
   }
 
-  const fragment = document.createDocumentFragment();
+  // Remove contests no longer requested
+  Array.from(container.querySelectorAll('.contest')).forEach(div => {
+    const id = div.id.replace('contest-', '');
+    if (!contestIds.includes(id)) {
+      div.remove();
+    }
+  });
+
+  const payloads = [];
   let rendered = false;
 
   for (const contestId of contestIds) {
     let contestDiv = document.getElementById(`contest-${contestId}`);
-    
     if (!contestDiv) {
       contestDiv = document.createElement('div');
       contestDiv.className = 'contest';
       contestDiv.id = `contest-${contestId}`;
-      fragment.appendChild(contestDiv);
-    } else {
-      // Clear existing content to re-render with teams
-      contestDiv.innerHTML = '';
     }
-    
-    // Get contest name from cache or use ID
     const contestName = contestInfoCache.get(contestId) || `Contest ${contestId}`;
     const contestUrl = `https://vjudge.net/contest/${contestId}`;
     contestDiv.innerHTML = `<h2><a href="${contestUrl}" target="_blank" rel="noopener noreferrer">${contestName}</a></h2>`;
+
+    container.appendChild(contestDiv);
 
     let contestData;
     if (useCacheOnly) {
@@ -1009,27 +1381,35 @@ async function renderResults({ forceRefetch = false, useCacheOnly = false, showS
     } else {
       contestData = await ensureContestData(contestId, { forceRefetch });
     }
+    payloads.push({ contestId, contestDiv, contestData });
+  }
 
+  if (inputs.includeAllTeams) {
+    teamContext = computeTeamContext(inputs, { forceRebuild: true });
+  } else {
+    teamContext = computeTeamContext(inputs);
+  }
+
+  for (const payload of payloads) {
+    const contestName = contestInfoCache.get(payload.contestId) || `Contest ${payload.contestId}`;
+    const contestUrl = `https://vjudge.net/contest/${payload.contestId}`;
+    payload.contestDiv.innerHTML = `<h2><a href="${contestUrl}" target="_blank" rel="noopener noreferrer">${contestName}</a></h2>`;
+
+    const contestData = payload.contestData;
     if (!contestData || contestData.error) {
       const errorMsg = contestData?.error || 'Unknown error';
-      contestDiv.innerHTML += `<div class="error">
-        ${errorMsg}
-      </div>`;
+      payload.contestDiv.innerHTML += `<div class="error">${errorMsg}</div>`;
     } else {
       rendered = true;
-      renderTeamsForContest(contestDiv, contestData, teamGroups);
-    }
-
-    if (fragment.contains(contestDiv)) {
-      // contestDiv is new, keep it in fragment
-    } else {
-      // contestDiv already in DOM, already updated
+      renderTeamsForContest(payload.contestDiv, contestData, teamContext.teamGroups, {
+        includeAllTeams: inputs.includeAllTeams,
+        contestId: payload.contestId,
+        contestTeams: teamContext.contestTeams.get(payload.contestId),
+        participants: contestData.participants
+      });
     }
   }
 
-  if (fragment.childNodes.length > 0) {
-    container.appendChild(fragment);
-  }
   refreshAggregateRanking();
   refreshEloStandings();
   return rendered;
@@ -1098,8 +1478,44 @@ function findBestGroupMatch(teamGroup, ranklist, participants = {}) {
 // Initialize on page load
 registerInputListener('contestInput');
 registerInputListener('teamInput');
+registerInputListener('teamMergeInput');
 initAggregateControls();
 initEloModeControls();
+
+const includeAllCheckbox = document.getElementById('includeAllTeams');
+if (includeAllCheckbox) {
+  toggleTeamInputMode(includeAllCheckbox.checked);
+  includeAllCheckbox.addEventListener('change', () => {
+    toggleTeamInputMode(includeAllCheckbox.checked);
+    invalidateTeamContext();
+    scheduleAutoRefresh();
+  });
+}
+
+document.addEventListener('click', (event) => {
+  const target = event.target.closest('[data-page-action]');
+  if (!target) return;
+  const pagination = target.closest('.table-pagination');
+  if (!pagination) return;
+  const tableId = pagination.dataset.tableId;
+  if (!tableId) return;
+  const action = target.dataset.pageAction;
+  const state = paginationState.get(tableId);
+  if (!state) return;
+  let nextPage = state.page || 1;
+  if (action === 'prev') {
+    nextPage = Math.max(1, nextPage - 1);
+  } else if (action === 'next') {
+    const maxPage = state.totalPages || nextPage + 1;
+    nextPage = Math.min(maxPage, nextPage + 1);
+  }
+  if (nextPage === state.page) return;
+  paginationState.set(tableId, { page: nextPage, totalPages: state.totalPages });
+  const renderer = paginationRenderers.get(tableId);
+  if (renderer) {
+    renderer();
+  }
+});
 
 // Listen to upsolve checkbox changes
 const upsolveCheckbox = document.getElementById('includeUpsolve');
@@ -1107,6 +1523,7 @@ if (upsolveCheckbox) {
   upsolveCheckbox.addEventListener('change', () => {
     // Clear cache to force re-calculation
     contestCache.clear();
+    invalidateTeamContext();
     scheduleAutoRefresh();
   });
 }

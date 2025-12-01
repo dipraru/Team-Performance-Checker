@@ -28,10 +28,27 @@
           Team Names
         </label>
         <input type="text" id="teamInput" placeholder="Enter team names separated by commas (e.g., team1, team2)">
-        <div style="font-size: 12px; color: #64748b; margin-top: 8px; line-height: 1.5;">
+        <div id="teamAliasTip" style="font-size: 12px; color: #64748b; margin-top: 8px; line-height: 1.5;">
           💡 <strong>Tip:</strong> If a team uses multiple IDs, group them in parentheses: <code style="background: #f1f5f9; padding: 2px 6px; border-radius: 3px; font-family: monospace;">(id1, id2), team3</code>
           <br>The best ranking among grouped IDs will be used.
         </div>
+      </div>
+
+      <div class="form-group include-toggle">
+        <label class="toggle-label">
+          <input type="checkbox" id="includeAllTeams">
+          <span>Include every team from the selected contests</span>
+        </label>
+        <div class="helper-text">Automatically adds every standings entry. Enable "Team merge rules" below to combine duplicate IDs.</div>
+      </div>
+
+      <div class="form-group" id="teamMergeWrapper" style="display: none;">
+        <label>
+          <span class="icon">🔁</span>
+          Team merge rules
+        </label>
+        <input type="text" id="teamMergeInput" placeholder="(alpha_id, beta_id), (teamX, teamY)">
+        <div class="merge-hint">List handles that should be treated as the same team. Use the same parentheses format as above.</div>
       </div>
 
       <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
